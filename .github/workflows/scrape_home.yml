@@ -1,0 +1,69 @@
+name: CSQAQ Scrape Home
+
+on:
+  workflow_dispatch:
+    inputs:
+      indices:
+        description: '逗号分隔的指数 ID（默认全部）'
+        required: false
+        default: ''
+      periods:
+        description: '逗号分隔的周期（默认 daily,hours）'
+        required: false
+        default: ''
+
+concurrency:
+  group: scrape-home-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-python-v1
+
+      - name: Install playwright
+        run: pip install playwright
+
+      - name: Install Playwright Browsers (cache miss)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install chromium
+
+      - name: Install browser dependencies (cache hit)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
+      - name: Run scrape_home
+        env:
+          INPUT_INDICES: ${{ github.event.inputs.indices }}
+          INPUT_PERIODS: ${{ github.event.inputs.periods }}
+        run: |
+          ARGS=""
+          if [ -n "$INPUT_INDICES" ]; then
+            ARGS="$ARGS --indices $INPUT_INDICES"
+          fi
+          if [ -n "$INPUT_PERIODS" ]; then
+            ARGS="$ARGS --periods $INPUT_PERIODS"
+          fi
+          python scrape_home.py $ARGS
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: home_result
+          path: home_result.json
