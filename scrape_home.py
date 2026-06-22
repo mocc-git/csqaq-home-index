@@ -6,17 +6,21 @@
 
 数据来源：
 1. GET /proxies/api/v1/current_data — 所有指数当前值 + 武器类型涨跌 + 其他指标
-2. GET /proxies/api/v1/sub_data?id={id}&type={type} — 指数 K 线历史（daily/hours）
+2. GET /proxies/api/v1/sub_data?id={id}&type={type} — 指数 K 线历史（daily/hours，main_data 合成）
+3. GET /proxies/api/v1/sub/kline?id={id}&type={type} — 真实 OHLCV 历史（1hour/4hour/1day/7day）
+4. GET /api/v1/info/get_rank_list — 涨跌排行（36 条）
+5. GET /api/v1/monitor/rank — 库存监控排行（196 条）
 
 用法：
   python scrape_home.py
   python scrape_home.py --indices 1,2,7,8  # 只抓指定指数
-  python scrape_home.py --periods daily,hours  # 只抓指定周期
+  python scrape_home.py --periods 1hour,4hour,1day,7day  # 只抓指定周期
 """
 
 import argparse
 import json
 import datetime
+import urllib.parse
 from playwright.sync_api import sync_playwright
 
 HOME_URL = "https://csqaq.com/home"
@@ -26,8 +30,11 @@ RESULT_FILE = "home_result.json"
 # id -> (name, name_key)
 DEFAULT_INDEX_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 
-# 默认抓取的周期
+# 默认抓取的周期（sub_data 旧接口，main_data 合成）
 DEFAULT_PERIODS = ["daily", "hours"]
+
+# K 线真实 OHLCV 周期（sub/kline 新接口）
+DEFAULT_KLINE_PERIODS = ["1hour", "4hour", "1day", "7day"]
 
 # 指数名称映射（用于点击切换）
 INDEX_NAME_MAP = {
@@ -38,15 +45,84 @@ INDEX_NAME_MAP = {
     21: "收藏品", 22: "多普勒", 23: "伽玛多普勒", 24: "红皮指数",
 }
 
-# 周期切换按钮文本映射
+# 周期切换按钮文本映射（sub_data 旧接口）
 PERIOD_BUTTON_MAP = {
     "daily": "日线",
     "hours": "时线",
 }
 
+# K 线周期按钮文本映射（sub/kline 新接口，第二套按钮 .item.period）
+KLINE_PERIOD_MAP = {
+    "1hour": "1小时",
+    "4hour": "4小时",
+    "1day": "日线",
+    "7day": "周线",
+}
 
-def scrape_home(page, index_ids, periods):
-    """抓取首页数据"""
+
+def _click_index_by_name(page, idx_name):
+    """点击指数名称切换（匹配文本内容且可见的叶子元素）"""
+    return page.evaluate(f"""() => {{
+        const allElements = document.querySelectorAll('*');
+        for (const el of allElements) {{
+            if (el.textContent.trim() === '{idx_name}' && el.offsetParent !== null && el.children.length === 0) {{
+                el.click();
+                return true;
+            }}
+        }}
+        return false;
+    }}""")
+
+
+def _click_kline_period(page, btn_text):
+    """点击 K 线周期按钮（第二套按钮 .item.period）"""
+    return page.evaluate(f"""() => {{
+        // 优先匹配 .item.period
+        let els = document.querySelectorAll('.item.period');
+        for (const el of els) {{
+            if (el.textContent.trim() === '{btn_text}' && el.offsetParent !== null) {{
+                el.click();
+                return true;
+            }}
+        }}
+        // 回退：匹配任意可见元素
+        const all = document.querySelectorAll('span, div, button');
+        for (const el of all) {{
+            if (el.textContent.trim() === '{btn_text}' && el.offsetParent !== null && el.children.length === 0) {{
+                el.click();
+                return true;
+            }}
+        }}
+        return false;
+    }}""")
+
+
+def _click_kline_mode_button(page):
+    """点击 .ant-segmented-item 的"K线"按钮，切换到 K 线模式"""
+    return page.evaluate("""() => {
+        const els = document.querySelectorAll('.ant-segmented-item');
+        for (const el of els) {
+            if (el.textContent.trim() === 'K线' && el.offsetParent !== null) {
+                el.click();
+                return true;
+            }
+        }
+        return false;
+    }""")
+
+
+def scrape_home(page, index_ids, periods, kline_periods=None):
+    """抓取首页数据
+
+    Args:
+        page: Playwright page
+        index_ids: 指数 ID 列表
+        periods: sub_data 旧接口周期列表（如 ['daily', 'hours']）
+        kline_periods: sub/kline 新接口周期列表（如 ['1hour', '4hour', '1day', '7day']），
+                       None 表示不抓取真实 OHLCV
+    """
+    if kline_periods is None:
+        kline_periods = []
     print(f"\n{'='*60}", flush=True)
     print(f"  抓取 CSQAQ 首页饰品指数数据", flush=True)
     print(f"  指数: {index_ids}", flush=True)
@@ -58,6 +134,9 @@ def scrape_home(page, index_ids, periods):
         "home_url": HOME_URL,
         "current_data": None,
         "sub_data": {},  # {index_id: {period: data}}
+        "sub_kline": {},  # {index_id: {period: [{t,o,c,h,l,v}, ...]}}
+        "rank_list": None,  # 涨跌排行 36 条
+        "monitor_rank": None,  # 库存监控排行 196 条
         "scrape_ok": False,
         "scrape_fail": "",
     }
@@ -66,11 +145,14 @@ def scrape_home(page, index_ids, periods):
     api_data = {
         "current_data": None,
         "sub_data": {},  # {(id, type): data}
+        "sub_kline": {},  # {(id, type): [{t,o,c,h,l,v}, ...]}
+        "rank_list": None,
+        "monitor_rank": None,
     }
 
     def handle_response(response):
         url = response.url
-        if "csqaq.com/proxies/api" not in url:
+        if "csqaq.com" not in url:
             return
         try:
             body = response.text()
@@ -78,19 +160,17 @@ def scrape_home(page, index_ids, periods):
                 return
 
             # current_data 接口
-            if "current_data" in url:
+            if "/proxies/api/v1/current_data" in url:
                 parsed = json.loads(body)
                 if parsed.get("code") == 200 and parsed.get("data"):
                     api_data["current_data"] = parsed["data"]
                     print(f"  [拦截] current_data: {len(body)} bytes", flush=True)
                 return
 
-            # sub_data 接口
-            if "sub_data" in url:
+            # sub_data 接口（旧，main_data 合成）
+            if "/proxies/api/v1/sub_data" in url:
                 parsed = json.loads(body)
                 if parsed.get("code") == 200 and parsed.get("data"):
-                    # 解析 url 参数 id 和 type
-                    import urllib.parse
                     parsed_url = urllib.parse.urlparse(url)
                     params = urllib.parse.parse_qs(parsed_url.query)
                     idx_id = int(params.get("id", [0])[0])
@@ -98,6 +178,38 @@ def scrape_home(page, index_ids, periods):
                     if idx_id and idx_type:
                         api_data["sub_data"][(idx_id, idx_type)] = parsed["data"]
                         print(f"  [拦截] sub_data id={idx_id} type={idx_type}: {len(body)} bytes", flush=True)
+                return
+
+            # sub/kline 接口（新，真实 OHLCV）
+            if "/proxies/api/v1/sub/kline" in url:
+                parsed = json.loads(body)
+                if parsed.get("code") == 200 and parsed.get("data"):
+                    parsed_url = urllib.parse.urlparse(url)
+                    params = urllib.parse.parse_qs(parsed_url.query)
+                    idx_id = int(params.get("id", [0])[0])
+                    idx_type = params.get("type", [""])[0]
+                    if idx_id and idx_type:
+                        api_data["sub_kline"][(idx_id, idx_type)] = parsed["data"]
+                        cnt = len(parsed["data"])
+                        print(f"  [拦截] sub/kline id={idx_id} type={idx_type}: {cnt} 条", flush=True)
+                return
+
+            # get_rank_list 接口（涨跌排行）
+            if "/api/v1/info/get_rank_list" in url:
+                parsed = json.loads(body)
+                if parsed.get("code") == 200:
+                    api_data["rank_list"] = parsed.get("data") or []
+                    cnt = len(api_data["rank_list"]) if isinstance(api_data["rank_list"], list) else 0
+                    print(f"  [拦截] get_rank_list: {cnt} 条", flush=True)
+                return
+
+            # monitor/rank 接口（库存监控排行）
+            if "/api/v1/monitor/rank" in url:
+                parsed = json.loads(body)
+                if parsed.get("code") == 200:
+                    api_data["monitor_rank"] = parsed.get("data") or []
+                    cnt = len(api_data["monitor_rank"]) if isinstance(api_data["monitor_rank"], list) else 0
+                    print(f"  [拦截] monitor/rank: {cnt} 条", flush=True)
                 return
         except Exception as e:
             print(f"  [拦截异常] {type(e).__name__}: {e}", flush=True)
@@ -120,8 +232,8 @@ def scrape_home(page, index_ids, periods):
         else:
             print(f"  ✗ current_data 未加载", flush=True)
 
-        # 3. 抓取所有指数的 K 线数据
-        print(f"\n[3] 抓取所有指数的 K 线数据...", flush=True)
+        # 3. 抓取所有指数的 sub_data（旧接口，main_data 合成）
+        print(f"\n[3] 抓取所有指数的 sub_data...", flush=True)
         for idx_id in index_ids:
             idx_name = INDEX_NAME_MAP.get(idx_id, f"id={idx_id}")
             for period in periods:
@@ -132,22 +244,12 @@ def scrape_home(page, index_ids, periods):
 
                 # 点击指数名称切换
                 print(f"  点击 {idx_name}({idx_id})...", flush=True)
-                clicked = page.evaluate(f"""() => {{
-                    const allElements = document.querySelectorAll('*');
-                    for (const el of allElements) {{
-                        if (el.textContent.trim() === '{idx_name}' && el.offsetParent !== null && el.children.length === 0) {{
-                            el.click();
-                            return true;
-                        }}
-                    }}
-                    return false;
-                }}""")
-                if not clicked:
+                if not _click_index_by_name(page, idx_name):
                     print(f"    ✗ 未找到 {idx_name} 按钮", flush=True)
                     continue
                 page.wait_for_timeout(2000)
 
-                # 切换周期
+                # 切换周期（旧接口按钮）
                 period_btn = PERIOD_BUTTON_MAP.get(period)
                 if period_btn:
                     print(f"    切换周期到 {period_btn}...", flush=True)
@@ -171,8 +273,69 @@ def scrape_home(page, index_ids, periods):
                 else:
                     print(f"    ✗ {idx_name} {period}: 未获取到数据", flush=True)
 
-        # 4. 整理结果
-        print(f"\n[4] 整理结果...", flush=True)
+        # 4. 抓取真实 OHLCV（sub/kline 新接口）
+        if kline_periods:
+            print(f"\n[4] 抓取真实 OHLCV (sub/kline)...", flush=True)
+            print(f"  K 线周期: {kline_periods}", flush=True)
+
+            # 4.1 点击"K线"按钮切换到 K 线模式
+            print(f"  [4.1] 点击 K线 模式按钮...", flush=True)
+            if not _click_kline_mode_button(page):
+                print(f"    ✗ 未找到 K线 模式按钮，跳过 sub/kline 抓取", flush=True)
+            else:
+                page.wait_for_timeout(5000)
+
+                # 4.2 特殊处理：重置 K 线图状态
+                # 第一个指数（饰品指数）是默认选中状态，直接切换周期会失败
+                # 解决方案：先切换到其他指数（百元主战），再切回饰品指数
+                print(f"  [4.2] 特殊处理：重置 K 线图状态...", flush=True)
+                if 3 in index_ids:
+                    _click_index_by_name(page, "百元主战")
+                    page.wait_for_timeout(3000)
+                _click_index_by_name(page, "饰品指数")
+                page.wait_for_timeout(3000)
+
+                # 4.3 遍历所有指数 × 所有 K 线周期
+                print(f"  [4.3] 遍历 {len(index_ids)} 指数 × {len(kline_periods)} 周期...", flush=True)
+                for idx_id in index_ids:
+                    idx_name = INDEX_NAME_MAP.get(idx_id, f"id={idx_id}")
+                    # 每个指数只点击 1 次（避免重复点击重置 K 线图）
+                    print(f"    切换到 {idx_name}({idx_id})...", flush=True)
+                    if not _click_index_by_name(page, idx_name):
+                        print(f"      ✗ 未找到 {idx_name} 按钮", flush=True)
+                        continue
+                    page.wait_for_timeout(3000)
+
+                    # 依次点击 4 个周期
+                    for period in kline_periods:
+                        btn_text = KLINE_PERIOD_MAP.get(period)
+                        if not btn_text:
+                            continue
+                        # 检查是否已有该数据
+                        if (idx_id, period) in api_data["sub_kline"]:
+                            print(f"      ✓ {idx_name} {period}: 已有数据", flush=True)
+                            continue
+
+                        print(f"      点击周期 {btn_text}...", flush=True)
+                        _click_kline_period(page, btn_text)
+                        page.wait_for_timeout(3500)
+
+                        # 检查是否获取到数据
+                        if (idx_id, period) in api_data["sub_kline"]:
+                            cnt = len(api_data["sub_kline"][(idx_id, period)])
+                            print(f"      ✓ {idx_name} {period}: {cnt} 条", flush=True)
+                        else:
+                            print(f"      ✗ {idx_name} {period}: 未获取到数据", flush=True)
+
+                # 4.4 汇总 sub/kline 抓取结果
+                kline_success = sum(1 for k in api_data["sub_kline"].keys())
+                kline_total = len(index_ids) * len(kline_periods)
+                print(f"\n  [4.4] sub/kline 汇总: {kline_success}/{kline_total} 成功", flush=True)
+        else:
+            print(f"\n[4] 跳过 sub/kline 抓取（kline_periods 为空）", flush=True)
+
+        # 5. 整理结果
+        print(f"\n[5] 整理结果...", flush=True)
         result["current_data"] = api_data["current_data"]
 
         for idx_id in index_ids:
@@ -185,6 +348,22 @@ def scrape_home(page, index_ids, periods):
             for period in periods:
                 if (idx_id, period) in api_data["sub_data"]:
                     result["sub_data"][str(idx_id)]["periods"][period] = api_data["sub_data"][(idx_id, period)]
+
+        # 整理 sub_kline（真实 OHLCV）
+        for idx_id in index_ids:
+            idx_name = INDEX_NAME_MAP.get(idx_id, f"id={idx_id}")
+            result["sub_kline"][str(idx_id)] = {
+                "name": idx_name,
+                "id": idx_id,
+                "periods": {},
+            }
+            for period in kline_periods:
+                if (idx_id, period) in api_data["sub_kline"]:
+                    result["sub_kline"][str(idx_id)]["periods"][period] = api_data["sub_kline"][(idx_id, period)]
+
+        # 整理 rank_list 和 monitor_rank
+        result["rank_list"] = api_data["rank_list"]
+        result["monitor_rank"] = api_data["monitor_rank"]
 
         # 标记成功
         if result["current_data"]:
@@ -203,7 +382,9 @@ def scrape_home(page, index_ids, periods):
 def main():
     parser = argparse.ArgumentParser(description="CSQAQ 首页饰品指数抓取")
     parser.add_argument("--indices", default="", help="逗号分隔的指数 ID（默认全部）")
-    parser.add_argument("--periods", default="", help="逗号分隔的周期（默认 daily,hours）")
+    parser.add_argument("--periods", default="", help="逗号分隔的 sub_data 周期（默认 daily,hours）")
+    parser.add_argument("--kline-periods", default="",
+                        help="逗号分隔的 sub/kline 周期（默认 1hour,4hour,1day,7day；传 'none' 跳过）")
     args = parser.parse_args()
 
     print("=" * 60, flush=True)
@@ -221,17 +402,27 @@ def main():
     else:
         periods = DEFAULT_PERIODS
 
+    # K 线真实 OHLCV 周期
+    if args.kline_periods == "none":
+        kline_periods = []
+    elif args.kline_periods:
+        kline_periods = [x.strip() for x in args.kline_periods.split(",") if x.strip()]
+    else:
+        kline_periods = DEFAULT_KLINE_PERIODS
+
     print(f"  指数: {index_ids}", flush=True)
-    print(f"  周期: {periods}", flush=True)
+    print(f"  sub_data 周期: {periods}", flush=True)
+    print(f"  sub/kline 周期: {kline_periods}", flush=True)
 
     start_time = datetime.datetime.now()
 
     result = {
-        "version": "v1",
+        "version": "v2",
         "start_time": start_time.isoformat(),
         "home_url": HOME_URL,
         "indices": index_ids,
         "periods": periods,
+        "kline_periods": kline_periods,
         "data": None,
     }
 
@@ -252,7 +443,7 @@ def main():
             )
             page = context.new_page()
 
-            scrape_result = scrape_home(page, index_ids, periods)
+            scrape_result = scrape_home(page, index_ids, periods, kline_periods=kline_periods)
             result["data"] = scrape_result
 
             browser.close()
@@ -290,7 +481,29 @@ def main():
                 ts_count = len(data.get("timestamp", []))
                 total_kline += ts_count
                 print(f"  sub_data id={idx_id}({info['name']}) {period}: {ts_count} 条", flush=True)
-        print(f"  K线总条数: {total_kline}", flush=True)
+        print(f"  sub_data K线总条数: {total_kline}", flush=True)
+
+        # sub_kline 汇总
+        sub_kline = result["data"].get("sub_kline", {})
+        total_kline_ohlc = 0
+        success_count = 0
+        fail_count = 0
+        for idx_id, info in sub_kline.items():
+            for period, kline_data in info.get("periods", {}).items():
+                cnt = len(kline_data) if isinstance(kline_data, list) else 0
+                total_kline_ohlc += cnt
+                success_count += 1
+                print(f"  sub_kline id={idx_id}({info['name']}) {period}: {cnt} 条", flush=True)
+        expected = len(index_ids) * len(kline_periods)
+        fail_count = max(0, expected - success_count)
+        print(f"  sub_kline 真实 OHLCV 总条数: {total_kline_ohlc}", flush=True)
+        print(f"  sub_kline 成功率: {success_count}/{expected}（失败 {fail_count}）", flush=True)
+
+        # rank_list 和 monitor_rank 汇总
+        rank_list = result["data"].get("rank_list") or []
+        monitor_rank = result["data"].get("monitor_rank") or []
+        print(f"  rank_list: {len(rank_list)} 条", flush=True)
+        print(f"  monitor_rank: {len(monitor_rank)} 条", flush=True)
     print(f"  耗时: {result['total_duration_seconds']:.0f}s", flush=True)
     print(f"  结果: {RESULT_FILE}", flush=True)
 
