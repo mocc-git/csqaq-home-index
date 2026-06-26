@@ -19,12 +19,13 @@
 
 import argparse
 import json
+import os
 import datetime
 import urllib.parse
 from playwright.sync_api import sync_playwright
 
 HOME_URL = "https://csqaq.com/home"
-RESULT_FILE = "home_result.json"
+RESULT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "results", "home_scrape_results.json")
 
 # 默认抓取的指数 ID（从 current_data 的 sub_index_data 获取）
 # id -> (name, name_key)
@@ -109,6 +110,57 @@ def _click_kline_mode_button(page):
         }
         return false;
     }""")
+
+
+def _ensure_vol_indicator(page):
+    """确保 VOL(成交量) 指标已打开
+
+    点击"指标"按钮打开菜单，检查 VOL(成交量) 是否已选中，
+    未选中则点击选中，确保 K 线图显示成交量数据。
+    打开后切换其他指标时 VOL 状态会保持，只需在 K 线模式开始时调用一次。
+
+    Returns:
+        dict: {success: bool, action: str, was_checked: bool}
+    """
+    print(f"  [VOL] 确保 VOL(成交量) 指标已打开...", flush=True)
+
+    # 1. 点击"指标"按钮打开菜单
+    menu_opened = page.evaluate("""() => {
+        const els = document.querySelectorAll('.item.tools');
+        for (const el of els) {
+            if (el.textContent.trim() === '指标') { el.click(); return true; }
+        }
+        return false;
+    }""")
+    if not menu_opened:
+        print(f"  [VOL] ✗ 未找到'指标'按钮", flush=True)
+        return {"success": False, "action": "menu_not_found", "was_checked": False}
+    page.wait_for_timeout(1500)
+
+    # 2. 检查并点击 VOL(成交量)
+    result = page.evaluate("""() => {
+        const els = document.querySelectorAll('.klinecharts-pro-checkbox');
+        for (const el of els) {
+            const label = el.querySelector('.label');
+            if (label && label.textContent.includes('VOL')) {
+                const isChecked = el.classList.contains('checked');
+                if (!isChecked) {
+                    el.click();
+                    return {action: 'opened', wasChecked: false, label: label.textContent};
+                }
+                return {action: 'already_open', wasChecked: true, label: label.textContent};
+            }
+        }
+        return {action: 'not_found', wasChecked: false};
+    }""")
+    print(f"  [VOL] 结果: {result}", flush=True)
+
+    # 3. 关闭菜单
+    page.evaluate("document.body.click()")
+    page.wait_for_timeout(500)
+
+    success = result.get("action") in ("opened", "already_open")
+    return {"success": success, **result}
 
 
 def scrape_home(page, index_ids, periods, kline_periods=None):
@@ -217,22 +269,11 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
     page.on("response", handle_response)
 
     try:
-        # 1. 访问首页（改进：显式等待 current_data 接口，替代固定 8s 等待）
+        # 1. 访问首页
         print(f"\n[1] 访问首页...", flush=True)
-        try:
-            with page.expect_response(
-                lambda r: "/proxies/api/v1/current_data" in r.url, timeout=20000
-            ):
-                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
-            print(f"  首页加载完成（expect_response 成功）", flush=True)
-        except Exception:
-            print(f"  expect_response 超时，尝试 networkidle 兜底...", flush=True)
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-            page.wait_for_timeout(2000)
-            print(f"  首页加载完成（networkidle 兜底）", flush=True)
+        page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(8000)
+        print(f"  首页加载完成", flush=True)
 
         # 2. 等待 current_data 加载
         print(f"\n[2] 等待 current_data 加载...", flush=True)
@@ -296,26 +337,61 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
             else:
                 page.wait_for_timeout(5000)
 
-                # 4.2 特殊处理：重置 K 线图状态
-                # 第一个指数（饰品指数）是默认选中状态，直接切换周期会失败
-                # 解决方案：先切换到其他指数（百元主战），再切回饰品指数
-                print(f"  [4.2] 特殊处理：重置 K 线图状态...", flush=True)
+                # 4.1.1 确保 VOL(成交量) 指标已打开
+                # VOL 指标打开后切换指数时状态会保持，只需在 K 线模式开始时确认一次
+                vol_result = _ensure_vol_indicator(page)
+                if not vol_result["success"]:
+                    print(f"    ⚠ VOL 指标确保失败: {vol_result['action']}，继续采集", flush=True)
+                page.wait_for_timeout(2000)
+
+                # 4.2 特殊处理：切换到百元主战，重置 K 线图选中状态
+                # 根因：饰品指数是默认选中状态，主循环点击"饰品指数"名称时
+                # 页面认为是当前选中，不重新加载K线图，导致后续周期按钮无效
+                # 修复：只切换到百元主战（不切回饰品指数），让主循环从饰品指数开始时
+                # 点击"饰品指数"名称会触发页面重新加载K线图（发送1hour请求）
+                print(f"  [4.2] 特殊处理：切换到百元主战，重置 K 线图选中状态...", flush=True)
                 if 3 in index_ids:
-                    _click_index_by_name(page, "百元主战")
-                    page.wait_for_timeout(3000)
-                _click_index_by_name(page, "饰品指数")
-                page.wait_for_timeout(3000)
+                    if not _click_index_by_name(page, "百元主战"):
+                        print(f"    ⚠ 未找到 百元主战 按钮", flush=True)
+                    # 轮询等待百元主战默认周期(1hour)API响应到达，最长10秒
+                    for _w in range(20):
+                        if (3, "1hour") in api_data["sub_kline"]:
+                            print(f"  ✓ 百元主战 1hour 默认数据已到达（K线图已重置）", flush=True)
+                            break
+                        page.wait_for_timeout(500)
+                    else:
+                        print(f"  ⚠ 百元主战 1hour 默认数据等待超时(10s)", flush=True)
+                else:
+                    # 百元主战不在列表中，无法重置，直接继续
+                    print(f"    ⚠ 百元主战不在指数列表中，跳过重置", flush=True)
 
                 # 4.3 遍历所有指数 × 所有 K 线周期
                 print(f"  [4.3] 遍历 {len(index_ids)} 指数 × {len(kline_periods)} 周期...", flush=True)
                 for idx_id in index_ids:
                     idx_name = INDEX_NAME_MAP.get(idx_id, f"id={idx_id}")
-                    # 每个指数只点击 1 次（避免重复点击重置 K 线图）
+                    # 切换指数名称：页面会自动重新加载K线图（发送1hour请求）
+                    # 注意：必须从非选中状态切换才会触发，4.2已确保当前选中百元主战
                     print(f"    切换到 {idx_name}({idx_id})...", flush=True)
                     if not _click_index_by_name(page, idx_name):
                         print(f"      ✗ 未找到 {idx_name} 按钮", flush=True)
                         continue
+                    # 固定等待3秒让页面切换完成（K线图重新加载需要时间）
                     page.wait_for_timeout(3000)
+
+                    # 轮询等待1hour默认数据到达（最长8秒）
+                    # 切换指数名称时页面会发送1hour请求，确认K线图已重新加载
+                    if "1hour" in kline_periods and (idx_id, "1hour") not in api_data["sub_kline"]:
+                        for _w in range(16):
+                            if (idx_id, "1hour") in api_data["sub_kline"]:
+                                cnt = len(api_data["sub_kline"][(idx_id, "1hour")])
+                                print(f"      ✓ {idx_name} 1hour: {cnt} 条（K线图已加载）", flush=True)
+                                break
+                            page.wait_for_timeout(500)
+                        else:
+                            print(f"      ⚠ {idx_name} 1hour: 默认数据等待超时", flush=True)
+                    elif "1hour" in kline_periods:
+                        cnt = len(api_data["sub_kline"][(idx_id, "1hour")])
+                        print(f"      ✓ {idx_name} 1hour: 已有数据 {cnt} 条", flush=True)
 
                     # 依次点击 4 个周期
                     for period in kline_periods:
@@ -328,15 +404,19 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
                             continue
 
                         print(f"      点击周期 {btn_text}...", flush=True)
-                        _click_kline_period(page, btn_text)
-                        page.wait_for_timeout(3500)
-
-                        # 检查是否获取到数据
-                        if (idx_id, period) in api_data["sub_kline"]:
-                            cnt = len(api_data["sub_kline"][(idx_id, period)])
-                            print(f"      ✓ {idx_name} {period}: {cnt} 条", flush=True)
+                        click_ok = _click_kline_period(page, btn_text)
+                        if not click_ok:
+                            print(f"      ✗ 未找到 {btn_text} 按钮", flush=True)
+                            continue
+                        # 轮询等待API响应，最长8秒
+                        for _w in range(16):
+                            if (idx_id, period) in api_data["sub_kline"]:
+                                cnt = len(api_data["sub_kline"][(idx_id, period)])
+                                print(f"      ✓ {idx_name} {period}: {cnt} 条", flush=True)
+                                break
+                            page.wait_for_timeout(500)
                         else:
-                            print(f"      ✗ {idx_name} {period}: 未获取到数据", flush=True)
+                            print(f"      ✗ {idx_name} {period}: 等待超时未获取到数据", flush=True)
 
                 # 4.4 汇总 sub/kline 抓取结果
                 kline_success = sum(1 for k in api_data["sub_kline"].keys())
@@ -454,15 +534,7 @@ def main():
             )
             page = context.new_page()
 
-            # 改进：scrape_home 失败时重试 1 次
-            max_retries = 1
-            for attempt in range(max_retries + 1):
-                scrape_result = scrape_home(page, index_ids, periods, kline_periods=kline_periods)
-                if scrape_result.get("scrape_ok") or attempt == max_retries:
-                    break
-                print(f"\n[重试] 第 {attempt+1} 次抓取失败，重试...", flush=True)
-                page.goto("about:blank")
-                page.wait_for_timeout(1000)
+            scrape_result = scrape_home(page, index_ids, periods, kline_periods=kline_periods)
             result["data"] = scrape_result
 
             browser.close()
