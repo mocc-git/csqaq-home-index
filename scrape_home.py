@@ -269,11 +269,22 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
     page.on("response", handle_response)
 
     try:
-        # 1. 访问首页
+        # 1. 访问首页（改进：显式等待 current_data 接口，替代固定 8s 等待）
         print(f"\n[1] 访问首页...", flush=True)
-        page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(8000)
-        print(f"  首页加载完成", flush=True)
+        try:
+            with page.expect_response(
+                lambda r: "/proxies/api/v1/current_data" in r.url, timeout=20000
+            ):
+                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+            print(f"  首页加载完成（expect_response 成功）", flush=True)
+        except Exception:
+            print(f"  expect_response 超时，尝试 networkidle 兜底...", flush=True)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+            print(f"  首页加载完成（networkidle 兜底）", flush=True)
 
         # 2. 等待 current_data 加载
         print(f"\n[2] 等待 current_data 加载...", flush=True)
@@ -534,7 +545,15 @@ def main():
             )
             page = context.new_page()
 
-            scrape_result = scrape_home(page, index_ids, periods, kline_periods=kline_periods)
+            # 改进：scrape_home 失败时重试 1 次
+            max_retries = 1
+            for attempt in range(max_retries + 1):
+                scrape_result = scrape_home(page, index_ids, periods, kline_periods=kline_periods)
+                if scrape_result.get("scrape_ok") or attempt == max_retries:
+                    break
+                print(f"\n[重试] 第 {attempt+1} 次抓取失败，重试...", flush=True)
+                page.goto("about:blank")
+                page.wait_for_timeout(1000)
             result["data"] = scrape_result
 
             browser.close()
