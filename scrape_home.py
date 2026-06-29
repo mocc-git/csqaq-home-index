@@ -34,7 +34,8 @@ DEFAULT_INDEX_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 
 DEFAULT_PERIODS = ["daily", "hours"]
 
 # K 线真实 OHLCV 周期（sub/kline 新接口）
-DEFAULT_KLINE_PERIODS = ["1hour", "4hour", "1day", "7day"]
+# 已移除 4hour，与 SteamDT 保持一致（SteamDT 无 4hour 周期）
+DEFAULT_KLINE_PERIODS = ["1hour", "1day", "7day"]
 
 # 指数名称映射（用于点击切换）
 INDEX_NAME_MAP = {
@@ -54,7 +55,6 @@ PERIOD_BUTTON_MAP = {
 # K 线周期按钮文本映射（sub/kline 新接口，第二套按钮 .item.period）
 KLINE_PERIOD_MAP = {
     "1hour": "1小时",
-    "4hour": "4小时",
     "1day": "日线",
     "7day": "周线",
 }
@@ -162,6 +162,70 @@ def _ensure_vol_indicator(page):
     return {"success": success, **result}
 
 
+def _load_csqaq_full_kline(page, idx_id, period, api_data_ref, max_slides=6):
+    """通过 dataZoom 向左滑动加载 csqaq 完整 K 线历史数据
+
+    csqaq 使用 klinecharts-pro 库，通过调用 chart.getDataList() 获取数据。
+    滑动策略：多次点击左侧/触发 dataZoom 向左滚动，触发懒加载更多历史数据，
+    直到连续两次滑动后数据条数不再增长。
+
+    Args:
+        page: Playwright page
+        idx_id: 指数ID
+        period: 周期字符串
+        api_data_ref: api_data dict引用（用于更新sub_kline）
+        max_slides: 最大滑动次数
+    """
+    print(f"  [dataZoom] 加载 {idx_id} {period} 完整历史...", flush=True)
+    key = (idx_id, period)
+
+    prev_count = 0
+    try:
+        initial = api_data_ref.get("sub_kline", {}).get(key, [])
+        prev_count = len(initial) if isinstance(initial, list) else 0
+    except Exception:
+        pass
+
+    if prev_count == 0:
+        print(f"  [dataZoom] ⚠ 初始数据为空，跳过滑动", flush=True)
+        return prev_count
+
+    chart_expr = """(window.__klineChart || (
+        (() => {
+            const charts = document.querySelectorAll('div');
+            for (const d of charts) {
+                if (d.__klinecharts__ || d._chart) return d.__klinecharts__ || d._chart;
+            }
+            return null;
+        })()
+    ))"""
+
+    stable_rounds = 0
+    for slide_idx in range(max_slides):
+        try:
+            page.evaluate(f"""{chart_expr} && {chart_expr}.scrollToDataIndex && {chart_expr}.scrollToDataIndex(0)""")
+            page.wait_for_timeout(2000)
+
+            current = api_data_ref.get("sub_kline", {}).get(key, [])
+            current_count = len(current) if isinstance(current, list) else 0
+
+            if current_count > prev_count:
+                print(f"  [dataZoom] 第{slide_idx+1}次滑动: {prev_count} -> {current_count} 条", flush=True)
+                prev_count = current_count
+                stable_rounds = 0
+            else:
+                stable_rounds += 1
+                if stable_rounds >= 2:
+                    print(f"  [dataZoom] 数据不再增长，停止滑动（最终 {current_count} 条）", flush=True)
+                    break
+        except Exception as e:
+            print(f"  [dataZoom] 滑动异常: {e}", flush=True)
+            break
+
+    page.wait_for_timeout(1000)
+    return prev_count
+
+
 def scrape_home(page, index_ids, periods, kline_periods=None):
     """抓取首页数据
 
@@ -186,6 +250,7 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
         "current_data": None,
         "sub_data": {},  # {index_id: {period: data}}
         "sub_kline": {},  # {index_id: {period: [{t,o,c,h,l,v}, ...]}}
+        "steamdt_kline": {},  # SteamDT双源数据 {broad/block_id: {name, periods: {period: [{t,o,c,h,l,v,tur}]}}}
         "rank_list": None,  # 涨跌排行 36 条
         "monitor_rank": None,  # 库存监控排行 196 条
         "scrape_ok": False,
@@ -417,10 +482,30 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
                         else:
                             print(f"      ✗ {idx_name} {period}: 等待超时未获取到数据", flush=True)
 
-                # 4.4 汇总 sub/kline 抓取结果
+                # 4.4 dataZoom滑动加载日线完整数据（仅1day）
+                print(f"\n  [4.4] dataZoom滑动加载日线完整数据...", flush=True)
+                target_indices_for_zoom = [1]
+                for idx_id in target_indices_for_zoom:
+                    if idx_id not in index_ids:
+                        continue
+                    if "1day" not in kline_periods:
+                        continue
+                    idx_name = INDEX_NAME_MAP.get(idx_id, f"id={idx_id}")
+                    if (idx_id, "1day") in api_data["sub_kline"]:
+                        print(f"    切换到 {idx_name}({idx_id}) 日线...", flush=True)
+                        if not _click_index_by_name(page, idx_name):
+                            print(f"      ✗ 未找到 {idx_name}", flush=True)
+                            continue
+                        page.wait_for_timeout(2000)
+                        _click_kline_period(page, KLINE_PERIOD_MAP["1day"])
+                        page.wait_for_timeout(3000)
+                        final_count = _load_csqaq_full_kline(page, idx_id, "1day", api_data)
+                        print(f"      ✓ {idx_name} 1day 最终: {final_count} 条", flush=True)
+
+                # 4.5 汇总 sub/kline 抓取结果
                 kline_success = sum(1 for k in api_data["sub_kline"].keys())
                 kline_total = len(index_ids) * len(kline_periods)
-                print(f"\n  [4.4] sub/kline 汇总: {kline_success}/{kline_total} 成功", flush=True)
+                print(f"\n  [4.5] sub/kline 汇总: {kline_success}/{kline_total} 成功", flush=True)
         else:
             print(f"\n[4] 跳过 sub/kline 抓取（kline_periods 为空）", flush=True)
 
@@ -455,6 +540,23 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
         result["rank_list"] = api_data["rank_list"]
         result["monitor_rank"] = api_data["monitor_rank"]
 
+        # 6. 采集 SteamDT 双源数据（复用同一 page/context）
+        print(f"\n[6] 采集 SteamDT 大盘+热门板块数据...", flush=True)
+        try:
+            from scrape_steamdt import scrape_steamdt
+            steamdt_result = scrape_steamdt(page)
+            result["steamdt_kline"] = steamdt_result.get("indices", {})
+            if steamdt_result.get("scrape_ok"):
+                broad = steamdt_result.get("broad", {})
+                blocks = steamdt_result.get("blocks", {})
+                bperiods = list(broad.get("periods", {}).keys()) if broad else []
+                print(f"  ✓ SteamDT 采集成功: 大盘周期{bperiods}, 板块{len(blocks)}个", flush=True)
+            else:
+                print(f"  ⚠ SteamDT 采集失败: {steamdt_result.get('scrape_fail', 'unknown')}", flush=True)
+        except Exception as e:
+            print(f"  ⚠ SteamDT 采集异常: {type(e).__name__}: {e}", flush=True)
+            result["steamdt_kline"] = {}
+
         # 标记成功
         if result["current_data"]:
             result["scrape_ok"] = True
@@ -474,7 +576,7 @@ def main():
     parser.add_argument("--indices", default="", help="逗号分隔的指数 ID（默认全部）")
     parser.add_argument("--periods", default="", help="逗号分隔的 sub_data 周期（默认 daily,hours）")
     parser.add_argument("--kline-periods", default="",
-                        help="逗号分隔的 sub/kline 周期（默认 1hour,4hour,1day,7day；传 'none' 跳过）")
+                        help="逗号分隔的 sub/kline 周期（默认 1hour,1day,7day；传 'none' 跳过）")
     args = parser.parse_args()
 
     print("=" * 60, flush=True)
@@ -602,6 +704,20 @@ def main():
         monitor_rank = result["data"].get("monitor_rank") or []
         print(f"  rank_list: {len(rank_list)} 条", flush=True)
         print(f"  monitor_rank: {len(monitor_rank)} 条", flush=True)
+
+        # steamdt_kline 汇总
+        steamdt = result["data"].get("steamdt_kline", {})
+        if steamdt:
+            steamdt_total = 0
+            for sid, sinfo in steamdt.items():
+                for pk, pdata in sinfo.get("periods", {}).items():
+                    cnt = len(pdata) if isinstance(pdata, list) else 0
+                    steamdt_total += cnt
+            broad = steamdt.get("broad", {})
+            bperiods = list(broad.get("periods", {}).keys())
+            print(f"  steamdt_kline: 大盘周期{bperiods}, 板块{len(steamdt)-1}个, 总{steamdt_total}条", flush=True)
+        else:
+            print(f"  steamdt_kline: 无数据", flush=True)
     print(f"  耗时: {result['total_duration_seconds']:.0f}s", flush=True)
     print(f"  结果: {RESULT_FILE}", flush=True)
 
