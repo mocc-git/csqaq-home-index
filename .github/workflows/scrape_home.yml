@@ -20,33 +20,28 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-
     steps:
       - uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
+      - name: Install playwright
+        run: pip install playwright
+      - name: Get playwright version
+        id: pw-version
+        run: echo "version=$(pip show playwright | grep '^Version:' | awk '{print $2}')" >> $GITHUB_OUTPUT
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-python-v1
-
-      - name: Install playwright
-        run: pip install playwright
-
+          key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
       - name: Install Playwright Browsers (cache miss)
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: python -m playwright install chromium
-
-      - name: Install browser dependencies (cache hit)
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
+      - name: Install browser dependencies
         run: python -m playwright install-deps chromium
-
       - name: Run scrape_home
         env:
           INPUT_INDICES: ${{ github.event.inputs.indices }}
@@ -60,7 +55,6 @@ jobs:
             ARGS="$ARGS --periods $INPUT_PERIODS"
           fi
           python scrape_home.py $ARGS
-
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
