@@ -19,8 +19,11 @@
 
 import argparse
 import json
+import time
 import datetime
 import urllib.parse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from playwright.sync_api import sync_playwright
 
 HOME_URL = "https://csqaq.com/home"
@@ -31,7 +34,7 @@ RESULT_FILE = "home_result.json"
 DEFAULT_INDEX_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
 
 # 默认抓取的周期（sub_data 旧接口，main_data 合成）
-DEFAULT_PERIODS = ["daily", "hours"]
+DEFAULT_PERIODS = ["daily"]
 
 # K 线真实 OHLCV 周期（sub/kline 新接口）
 # 已移除 4hour，与 SteamDT 保持一致（SteamDT 无 4hour 周期）
@@ -162,6 +165,32 @@ def _ensure_vol_indicator(page):
     return {"success": success, **result}
 
 
+def load_last_result(filepath="last_home_result.json"):
+    """加载上次采集结果，用于增量模式判断是否跳过dataZoom
+
+    读取上次采集的 home_result.json，统计有完整历史（>=200条1day）的指数数量。
+    如果存在完整历史的指数，返回完整数据供合并使用；否则返回None。
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        sub_kline = data.get("sub_kline", {})
+        full_count = 0
+        for idx_id_str, info in sub_kline.items():
+            periods = info.get("periods", {})
+            if len(periods.get("1day", [])) >= 200:
+                full_count += 1
+        if full_count > 0:
+            print(f"  [增量] 加载上次结果: {full_count} 个指数有完整历史", flush=True)
+            return data
+        else:
+            print(f"  [增量] 上次结果无完整历史，将执行全量dataZoom", flush=True)
+            return None
+    except Exception:
+        print(f"  [增量] 无上次结果，将执行全量dataZoom", flush=True)
+        return None
+
+
 def _load_csqaq_full_kline(page, idx_id, period, api_data_ref, max_slides=6):
     """通过 dataZoom 向左滑动加载 csqaq 完整 K 线历史数据
 
@@ -226,7 +255,7 @@ def _load_csqaq_full_kline(page, idx_id, period, api_data_ref, max_slides=6):
     return prev_count
 
 
-def scrape_home(page, index_ids, periods, kline_periods=None):
+def scrape_home(page, index_ids, periods, kline_periods=None, skip_steamdt=False):
     """抓取首页数据
 
     Args:
@@ -235,6 +264,7 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
         periods: sub_data 旧接口周期列表（如 ['daily', 'hours']）
         kline_periods: sub/kline 新接口周期列表（如 ['1hour', '4hour', '1day', '7day']），
                        None 表示不抓取真实 OHLCV
+        skip_steamdt: D3模式专用，跳过SteamDT采集（由独立线程并行采集）
     """
     if kline_periods is None:
         kline_periods = []
@@ -483,14 +513,50 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
                             print(f"      ✗ {idx_name} {period}: 等待超时未获取到数据", flush=True)
 
                 # 4.4 dataZoom滑动加载日线完整数据（仅1day）
-                print(f"\n  [4.4] dataZoom滑动加载日线完整数据...", flush=True)
+                # G1: 条件跳过dataZoom（读取上次结果判断）
+                print(f"\n  [4.4] dataZoom滑动加载日线完整数据（G1增量模式）...", flush=True)
                 target_indices_for_zoom = list(index_ids)
+                last_result = load_last_result()
+                last_sub_kline = (last_result or {}).get("sub_kline", {})
+                g1_skipped = 0
+                g1_executed = 0
                 for idx_id in target_indices_for_zoom:
                     if idx_id not in index_ids:
                         continue
                     if "1day" not in kline_periods:
                         continue
                     idx_name = INDEX_NAME_MAP.get(idx_id, f"id={idx_id}")
+
+                    # G1: 检查上次结果是否已有完整历史（>=200条 1day）
+                    last_idx_data = last_sub_kline.get(str(idx_id), {})
+                    last_1day = (last_idx_data.get("periods", {})).get("1day", [])
+                    if len(last_1day) >= 200:
+                        # 合并所有周期（1day/1hour/7day）：current覆盖last相同timestamp
+                        # 修复：原逻辑只合并1day，1hour/7day历史数据会丢失
+                        last_periods = last_idx_data.get("periods", {})
+                        merge_summary = []
+                        for period in kline_periods:
+                            last_period_data = last_periods.get(period, [])
+                            current_period_data = api_data["sub_kline"].get((idx_id, period), [])
+                            if not last_period_data and not current_period_data:
+                                continue
+                            merged = {}
+                            for item in last_period_data:
+                                t = item.get("t")
+                                if t is not None:
+                                    merged[str(t)] = item
+                            for item in current_period_data:
+                                t = item.get("t")
+                                if t is not None:
+                                    merged[str(t)] = item
+                            merged_list = sorted(merged.values(), key=lambda x: int(x.get("t", 0)))
+                            api_data["sub_kline"][(idx_id, period)] = merged_list
+                            merge_summary.append(f"{period}:{len(last_period_data)}+{len(current_period_data)}={len(merged_list)}")
+                        print(f"    [增量] 跳过 {idx_name}({idx_id}) dataZoom（合并: {', '.join(merge_summary)}）", flush=True)
+                        g1_skipped += 1
+                        continue
+
+                    g1_executed += 1
                     if (idx_id, "1day") in api_data["sub_kline"]:
                         print(f"    切换到 {idx_name}({idx_id}) 日线...", flush=True)
                         if not _click_index_by_name(page, idx_name):
@@ -501,6 +567,7 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
                         page.wait_for_timeout(3000)
                         final_count = _load_csqaq_full_kline(page, idx_id, "1day", api_data)
                         print(f"      ✓ {idx_name} 1day 最终: {final_count} 条", flush=True)
+                print(f"  [4.4] G1汇总: 跳过{g1_skipped}个, 执行{g1_executed}个", flush=True)
 
                 # 4.5 汇总 sub/kline 抓取结果
                 kline_success = sum(1 for k in api_data["sub_kline"].keys())
@@ -541,21 +608,26 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
         result["monitor_rank"] = api_data["monitor_rank"]
 
         # 6. 采集 SteamDT 双源数据（复用同一 page/context）
-        print(f"\n[6] 采集 SteamDT 大盘+热门板块数据...", flush=True)
-        try:
-            from scrape_steamdt import scrape_steamdt
-            steamdt_result = scrape_steamdt(page)
-            result["steamdt_kline"] = steamdt_result.get("indices", {})
-            if steamdt_result.get("scrape_ok"):
-                broad = steamdt_result.get("broad", {})
-                blocks = steamdt_result.get("blocks", {})
-                bperiods = list(broad.get("periods", {}).keys()) if broad else []
-                print(f"  ✓ SteamDT 采集成功: 大盘周期{bperiods}, 板块{len(blocks)}个", flush=True)
-            else:
-                print(f"  ⚠ SteamDT 采集失败: {steamdt_result.get('scrape_fail', 'unknown')}", flush=True)
-        except Exception as e:
-            print(f"  ⚠ SteamDT 采集异常: {type(e).__name__}: {e}", flush=True)
+        # D3模式：skip_steamdt=True 时跳过，由独立线程并行采集
+        if skip_steamdt:
+            print(f"\n[6] 跳过 SteamDT 采集（D3模式：由独立线程并行采集）", flush=True)
             result["steamdt_kline"] = {}
+        else:
+            print(f"\n[6] 采集 SteamDT 大盘+热门板块数据...", flush=True)
+            try:
+                from scrape_steamdt import scrape_steamdt
+                steamdt_result = scrape_steamdt(page)
+                result["steamdt_kline"] = steamdt_result.get("indices", {})
+                if steamdt_result.get("scrape_ok"):
+                    broad = steamdt_result.get("broad", {})
+                    blocks = steamdt_result.get("blocks", {})
+                    bperiods = list(broad.get("periods", {}).keys()) if broad else []
+                    print(f"  ✓ SteamDT 采集成功: 大盘周期{bperiods}, 板块{len(blocks)}个", flush=True)
+                else:
+                    print(f"  ⚠ SteamDT 采集失败: {steamdt_result.get('scrape_fail', 'unknown')}", flush=True)
+            except Exception as e:
+                print(f"  ⚠ SteamDT 采集异常: {type(e).__name__}: {e}", flush=True)
+                result["steamdt_kline"] = {}
 
         # 标记成功
         if result["current_data"]:
@@ -571,8 +643,91 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
     return result
 
 
+def run_csqaq_subset_thread(subset_index_ids, periods, kline_periods, group_id):
+    """D4线程：独立Playwright实例运行CSQAQ子集采集（跳过SteamDT）
+
+    Args:
+        subset_index_ids: 该线程负责的指数ID子集
+        periods: sub_data周期
+        kline_periods: sub/kline周期
+        group_id: 分组ID（用于日志标识）
+    """
+    print(f"\n[D4-G{group_id}] 启动子集线程, 指数={subset_index_ids}...", flush=True)
+    thread_start = datetime.datetime.now()
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="zh-CN",
+            )
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = context.new_page()
+
+            max_retries = 1
+            scrape_result = None
+            for attempt in range(max_retries + 1):
+                scrape_result = scrape_home(page, subset_index_ids, periods,
+                                            kline_periods=kline_periods, skip_steamdt=True)
+                if scrape_result.get("scrape_ok") or attempt == max_retries:
+                    break
+                print(f"\n[D4-G{group_id}] 第 {attempt+1} 次抓取失败，重试...", flush=True)
+                page.goto("about:blank")
+                page.wait_for_timeout(1000)
+
+            browser.close()
+
+        elapsed = (datetime.datetime.now() - thread_start).total_seconds()
+        print(f"[D4-G{group_id}] 完成, 耗时 {elapsed:.0f}s", flush=True)
+        return scrape_result
+    except Exception as e:
+        print(f"[D4-G{group_id}] FATAL: {type(e).__name__}: {e}", flush=True)
+        return {"scrape_ok": False, "scrape_fail": f"FATAL: {type(e).__name__}: {e}"}
+
+
+def run_steamdt_thread():
+    """D4线程：独立Playwright实例运行SteamDT采集"""
+    print(f"\n[D4-SteamDT] 启动独立线程...", flush=True)
+    thread_start = datetime.datetime.now()
+    try:
+        from scrape_steamdt import scrape_steamdt
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="zh-CN",
+            )
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            page = context.new_page()
+
+            steamdt_result = scrape_steamdt(page)
+
+            browser.close()
+
+        elapsed = (datetime.datetime.now() - thread_start).total_seconds()
+        print(f"[D4-SteamDT] 完成, 耗时 {elapsed:.0f}s", flush=True)
+        return steamdt_result
+    except Exception as e:
+        print(f"[D4-SteamDT] FATAL: {type(e).__name__}: {e}", flush=True)
+        return {"scrape_ok": False, "scrape_fail": f"FATAL: {type(e).__name__}: {e}"}
+
+
 def main():
-    parser = argparse.ArgumentParser(description="CSQAQ 首页饰品指数抓取")
+    parser = argparse.ArgumentParser(description="CSQAQ 首页饰品指数抓取（D4 6context并行）")
     parser.add_argument("--indices", default="", help="逗号分隔的指数 ID（默认全部）")
     parser.add_argument("--periods", default="", help="逗号分隔的 sub_data 周期（默认 daily,hours）")
     parser.add_argument("--kline-periods", default="",
@@ -580,7 +735,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60, flush=True)
-    print("  CSQAQ 首页饰品指数 Playwright 抓取", flush=True)
+    print("  CSQAQ 6context并行抓取（D4全并行模式）", flush=True)
     print("=" * 60, flush=True)
 
     # 解析参数
@@ -602,14 +757,21 @@ def main():
     else:
         kline_periods = DEFAULT_KLINE_PERIODS
 
-    print(f"  指数: {index_ids}", flush=True)
+    # D4v2: 将指数分成3组（约8个/组）— 减少并发数避免GA runner资源不足
+    num_groups = 3
+    chunk_size = (len(index_ids) + num_groups - 1) // num_groups
+    groups = [index_ids[i*chunk_size:(i+1)*chunk_size] for i in range(num_groups)]
+    for i, g in enumerate(groups):
+        print(f"  G{i+1}: {g}", flush=True)
+
     print(f"  sub_data 周期: {periods}", flush=True)
     print(f"  sub/kline 周期: {kline_periods}", flush=True)
+    print(f"  模式: D4v2 并行（{num_groups}组CSQAQ + 1个SteamDT = {num_groups+1}线程）", flush=True)
 
     start_time = datetime.datetime.now()
 
     result = {
-        "version": "v2",
+        "version": "v2_d4_parallel",
         "start_time": start_time.isoformat(),
         "home_url": HOME_URL,
         "indices": index_ids,
@@ -618,35 +780,72 @@ def main():
         "data": None,
     }
 
+    # D4v2: 4线程并行采集（3个CSQAQ子集 + 1个SteamDT），2秒错峰启动
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            )
-            context = browser.new_context(
-                viewport={"width": 1400, "height": 900},
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                locale="zh-CN",
-            )
-            context.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
-            page = context.new_page()
+        with ThreadPoolExecutor(max_workers=num_groups + 1) as executor:
+            future_groups = {}
+            for i, group in enumerate(groups):
+                if group:
+                    future_groups[i+1] = executor.submit(
+                        run_csqaq_subset_thread, group, periods, kline_periods, i+1)
+                    time.sleep(2)  # 错峰启动，避免同时启动多个浏览器实例
+            time.sleep(2)
+            future_steamdt = executor.submit(run_steamdt_thread)
 
-            # 改进：scrape_home 失败时重试 1 次
-            max_retries = 1
-            for attempt in range(max_retries + 1):
-                scrape_result = scrape_home(page, index_ids, periods, kline_periods=kline_periods)
-                if scrape_result.get("scrape_ok") or attempt == max_retries:
-                    break
-                print(f"\n[重试] 第 {attempt+1} 次抓取失败，重试...", flush=True)
-                page.goto("about:blank")
-                page.wait_for_timeout(1000)
-            result["data"] = scrape_result
+            group_results = {}
+            for gid, future in future_groups.items():
+                group_results[gid] = future.result()
+            steamdt_result = future_steamdt.result()
 
-            browser.close()
+        # 合并3个CSQAQ子集结果
+        merged = {
+            "current_data": None,
+            "sub_data": {},
+            "sub_kline": {},
+            "rank_list": None,
+            "monitor_rank": None,
+            "steamdt_kline": {},
+            "scrape_ok": False,
+            "scrape_fail": "",
+        }
+        ok_count = 0
+        fail_msgs = []
+        for gid, gres in group_results.items():
+            if not gres:
+                fail_msgs.append(f"G{gid}:无结果")
+                print(f"[D4v2] G{gid} FAILED: 无结果", flush=True)
+                continue
+            if gres.get("scrape_ok"):
+                ok_count += 1
+                if not merged["current_data"]:
+                    merged["current_data"] = gres.get("current_data")
+                if not merged["rank_list"]:
+                    merged["rank_list"] = gres.get("rank_list")
+                if not merged["monitor_rank"]:
+                    merged["monitor_rank"] = gres.get("monitor_rank")
+                g_sub_data = gres.get("sub_data", {})
+                g_sub_kline = gres.get("sub_kline", {})
+                merged["sub_data"].update(g_sub_data)
+                merged["sub_kline"].update(g_sub_kline)
+                print(f"[D4v2] G{gid} OK: {len(g_sub_kline)} indices", flush=True)
+            else:
+                fail_msg = gres.get('scrape_fail', 'unknown')
+                fail_msgs.append(f"G{gid}:{fail_msg}")
+                print(f"[D4v2] G{gid} FAILED: {fail_msg}", flush=True)
+
+        merged["scrape_ok"] = ok_count > 0
+        merged["scrape_fail"] = "; ".join(fail_msgs) if fail_msgs else ""
+
+        # 合并SteamDT结果
+        if steamdt_result.get("scrape_ok"):
+            merged["steamdt_kline"] = steamdt_result.get("indices", {})
+            print(f"\n[D4v2] SteamDT 结果已合并", flush=True)
+        else:
+            print(f"\n[D4v2] ⚠ SteamDT 采集失败: {steamdt_result.get('scrape_fail', 'unknown')}", flush=True)
+
+        print(f"[D4v2] CSQAQ子集成功: {ok_count}/{len(group_results)}", flush=True)
+
+        result["data"] = merged
 
     except Exception as e:
         print(f"\n[FATAL] {type(e).__name__}: {e}", flush=True)
