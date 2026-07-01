@@ -484,7 +484,7 @@ def scrape_home(page, index_ids, periods, kline_periods=None):
 
                 # 4.4 dataZoom滑动加载日线完整数据（仅1day）
                 print(f"\n  [4.4] dataZoom滑动加载日线完整数据...", flush=True)
-                target_indices_for_zoom = [1]
+                target_indices_for_zoom = list(index_ids)
                 for idx_id in target_indices_for_zoom:
                     if idx_id not in index_ids:
                         continue
